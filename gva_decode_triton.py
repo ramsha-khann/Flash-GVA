@@ -1,8 +1,8 @@
+import ctypes
 import math
 import torch
 import triton
 import triton.language as tl
-from triton.runtime import driver
 
 @triton.jit
 def _gva_decode_split_kernel(
@@ -15,15 +15,15 @@ def _gva_decode_split_kernel(
     stride_op_b, stride_op_h, stride_op_s,
     stride_lp_b, stride_lp_h,
     HEADS_PER_GROUP: tl.constexpr,
-    D_H: tl.constexpr,
-    D_R: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    BLOCK_DH: tl.constexpr,
+    D_H: tl.constexpr,   # head dimension
+    D_R: tl.constexpr,   #rope dim
+    BLOCK_H: tl.constexpr, #how many head pos are proccessed together
+    BLOCK_DH: tl.constexpr,   #how many dim position is being processed
     BLOCK_DR: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    BLOCK_N: tl.constexpr,#token per loop step
 ):
-    b = tl.program_id(0)
-    g = tl.program_id(1)
+    g = tl.program_id(0)
+    b = tl.program_id(1)
     split = tl.program_id(2)
     b64 = b.to(tl.int64)
     seqlen = tl.load(Seqlens + b64).to(tl.int32)
@@ -32,7 +32,7 @@ def _gva_decode_split_kernel(
     split_start = split * split_len
     split_end = tl.minimum(split_start + split_len, seqlen)
 
-    offs_h = g * HEADS_PER_GROUP + tl.arange(0, BLOCK_H)
+    offs_h = g * HEADS_PER_GROUP + tl.arange(0, BLOCK_H) # which query heads needs to load
     mask_h = tl.arange(0, BLOCK_H) < HEADS_PER_GROUP
     offs_dh = tl.arange(0, BLOCK_DH)
     offs_dr = tl.arange(0, BLOCK_DR)
@@ -88,11 +88,10 @@ def _gva_decode_split_kernel(
     tl.store(
         O_part + b64 * stride_op_b + offs_h[None, :] * stride_op_h + split * stride_op_s
         + offs_dh[:, None],
-        o,
+        o.to(O_part.dtype.element_ty),  # fp32 partial, or the final O in the input dtype (1 split)
         mask=mask_dh[:, None] & mask_h[None, :],
     )
     tl.store(LSE_part + b64 * stride_lp_b + offs_h * stride_lp_h + split, lse, mask=mask_h)
-
 
 @triton.jit
 def _gva_merge_kernel(
@@ -132,33 +131,32 @@ def _gva_merge_kernel(
     o = tl.sum(w[:, None] * o_s, 0) / tl.where(has_tokens, w_sum, 1.0)
     lse = tl.where(has_tokens, lse_max + tl.log(w_sum), float("-inf"))
 
-    tl.store(O + b * stride_o_b + h * stride_o_h + offs_dh, o, mask=mask_dh)
+    tl.store(O + b * stride_o_b + h * stride_o_h + offs_dh, o.to(O.dtype.element_ty), mask=mask_dh)
     tl.store(LSE + b * stride_lse_b + h, lse)
 
 
-_CTAS_PER_SM = {}  # config -> CTAs of the split kernel that fit on one SM
+_CTAS_PER_SM = {}
 
 
-def _ctas_per_sm(kernel, device_index):
-    """CTAs of a compiled kernel that fit on one SM, as in Triton's fused-softmax tutorial."""
+def _ctas_per_sm(kernel):
     kernel._init_handles()
-    props = driver.active.utils.get_device_properties(device_index)
-    threads = 32 * kernel.metadata.num_warps
-    by_regs = props["max_num_regs"] // (kernel.n_regs * threads)
-    by_smem = props["max_shared_mem"] // max(kernel.metadata.shared, 1)
-    return max(1, min(by_regs, by_smem, 2048 // threads))
+    n = ctypes.c_int()
+    err = ctypes.CDLL("libcuda.so.1").cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        ctypes.byref(n), ctypes.c_void_p(kernel.function),
+        32 * kernel.metadata.num_warps, ctypes.c_size_t(kernel.metadata.shared),
+    )
+    assert err == 0, f"cuOccupancyMaxActiveBlocksPerMultiprocessor failed with CUDA error {err}"
+    return max(1, n.value)
 
 
-def _num_splits(ctas_per_split, slots, max_splits):
-    """Split count that fills the GPU most evenly.
+def _num_splits(ctas_per_split, num_sms, ctas_per_sm, max_splits):
+    for per_sm in range(max(1, round(2 * ctas_per_sm / 3)), 0, -1):
+        places = per_sm * num_sms
+        s = min(max_splits, places // ctas_per_split)
+        if s >= 1 and (ctas_per_split * s >= 0.9 * places or s == max_splits):
+            return s
 
-    The GPU runs `slots` CTAs at once (SMs * CTAs per SM). With s splits the grid
-    is ctas_per_split * s CTAs; if that is not close to a whole number of full
-    waves, some SMs get fewer CTAs and sit idle at the end. Measured on H100
-    (B=8, 64k): 256 CTAs = 1.94 per SM took 191 us, 288 CTAs = 2.18 per SM 207 us.
-    Take the fewest splits within 5% of the best fill: fewer splits, less merge work.
-    """
-    # Even the most splits fit in one wave: every extra CTA keeps another SM busy.
+    slots = num_sms * ctas_per_sm
     if ctas_per_split * max_splits <= slots:
         return max_splits
 
@@ -178,15 +176,12 @@ def gva_decode_attention(
     T, G = v_cache.shape[1], v_cache.shape[2]
     d_r = q_rope.shape[-1]
     assert H % G == 0 and v_cache.shape[-1] == d_h and k_rope_cache.shape[-1] == d_r
-    # tl.dot needs both operands in the same dtype.
     assert q_tilde.dtype == v_cache.dtype and q_rope.dtype == k_rope_cache.dtype
-    # Kernel indexes the last dim with stride 1.
     for t in (q_tilde, q_rope, v_cache, k_rope_cache):
         assert t.stride(-1) == 1
-    # The kernel reads the lengths from GPU memory. A CPU tensor would need a
-    # host->device copy here, which is not allowed during CUDA-graph capture.
-    assert cache_seqlens.is_cuda
-    # Rows of the transposed dots; wgmma needs >= 64.
+    # Lengths are read on-device; a CPU tensor with GPU inputs would need a
+    # host->device copy, which breaks CUDA-graph capture.
+    assert cache_seqlens.device == q_tilde.device
     assert block_n >= 64 and block_n & (block_n - 1) == 0
 
     dev = q_tilde.device
@@ -216,32 +211,28 @@ def gva_decode_attention(
             o_part.stride(0), o_part.stride(1), o_part.stride(2),
             lse_part.stride(0), lse_part.stride(1),
         )
-
+       
     if num_splits is None:
-        # How many CTAs fit on one SM depends on the compiled kernel (registers,
-        # shared memory), so compile once per config to read it. This is host-only
-        # and cached, but must happen before CUDA-graph capture, like Triton's
-        # first compile.
         key = (dev, q_tilde.dtype, q_rope.dtype, heads_per_group, d_h, d_r, block_n, num_stages)
         if key not in _CTAS_PER_SM:
             o_tmp = torch.empty(B, H, 1, d_h, dtype=torch.float32, device=dev)
             lse_tmp = torch.empty(B, H, 1, dtype=torch.float32, device=dev)
-            kernel = _gva_decode_split_kernel.warmup(*split_args(o_tmp, lse_tmp, 1), grid=(B, G, 1), **meta)
-            _CTAS_PER_SM[key] = _ctas_per_sm(kernel, dev.index)
+            kernel = _gva_decode_split_kernel.warmup(*split_args(o_tmp, lse_tmp, 1), grid=(G, B, 1), **meta)
+            _CTAS_PER_SM[key] = _ctas_per_sm(kernel)
         num_sms = torch.cuda.get_device_properties(dev).multi_processor_count
-        # Depends only on B, G, T and the GPU, never on cache_seqlens: CUDA-graph safe.
         max_splits = min(triton.cdiv(T, block_n), 64)
-        num_splits = _num_splits(B * G, num_sms * _CTAS_PER_SM[key], max_splits)
+        num_splits = _num_splits(B * G, num_sms, _CTAS_PER_SM[key], max_splits)
     num_splits = max(1, num_splits)
 
-    o_part = torch.empty(B, H, num_splits, d_h, dtype=torch.float32, device=dev)
+    o_dtype = q_tilde.dtype if num_splits == 1 else torch.float32
+    o_part = torch.empty(B, H, num_splits, d_h, dtype=o_dtype, device=dev)
     lse_part = torch.empty(B, H, num_splits, dtype=torch.float32, device=dev)
-    _gva_decode_split_kernel[(B, G, num_splits)](*split_args(o_part, lse_part, num_splits), **meta)
+    _gva_decode_split_kernel[(G, B, num_splits)](*split_args(o_part, lse_part, num_splits), **meta)
 
     if num_splits == 1:
         return o_part[:, :, 0], lse_part[:, :, 0]
 
-    o = torch.empty(B, H, d_h, dtype=torch.float32, device=dev)
+    o = torch.empty(B, H, d_h, dtype=q_tilde.dtype, device=dev)
     lse = torch.empty(B, H, dtype=torch.float32, device=dev)
     _gva_merge_kernel[(B, H)](
         o_part, lse_part, o, lse,
@@ -255,80 +246,3 @@ def gva_decode_attention(
         BLOCK_S=triton.next_power_of_2(num_splits),
     )
     return o, lse
-
-
-def _random_inputs(cfg, B, T, dtype, dev):
-    q_tilde = torch.randn(B, cfg.num_heads, cfg.d_h, dtype=dtype, device=dev)
-    q_rope = torch.randn(B, cfg.num_heads, cfg.d_r, dtype=dtype, device=dev)
-    v_cache = torch.randn(B, T, cfg.num_groups, cfg.d_h, dtype=dtype, device=dev)
-    k_rope_cache = torch.randn(B, T, cfg.d_r, dtype=dtype, device=dev)
-    return q_tilde, q_rope, v_cache, k_rope_cache
-
-
-def _check(name, o, lse, inputs, seq_lens, scale, atol):
-    from gva_reference import gva_decode_attention_ref, report_diff
-
-    o_ref, lse_ref = gva_decode_attention_ref(*inputs, seq_lens, scale)
-    live = seq_lens > 0
-    ok = report_diff(f"{name} o", o, o_ref, atol)
-    # lse is -inf for empty requests, and -inf - -inf = NaN, so compare those separately.
-    ok &= report_diff(f"{name} lse", lse[live], lse_ref[live], atol)
-    empty_ok = bool(torch.isneginf(lse[~live]).all())
-    print(f"[{'OK' if empty_ok else 'FAIL'}] {name}: lse == -inf for empty requests")
-    return ok and empty_ok
-
-
-def _test():
-    from gva_reference import GVAConfig
-
-    torch.manual_seed(0)
-    dev = "cuda"
-    for dtype, atol in [(torch.float32, 1e-2), (torch.bfloat16, 2e-2)]:
-        cfg = GVAConfig(d_model=64, num_heads=16, num_groups=4, d_h=128, d_n=128, d_r=16)
-        seq_lens = torch.tensor([0, 1, 63, 64, 65, 1000], device=dev)
-        B, T = len(seq_lens), int(seq_lens.max())
-        inputs = _random_inputs(cfg, B, T, dtype, dev)
-        # Unused cache slots may hold anything, NaN included; results must not change.
-        for b, L in enumerate(seq_lens.tolist()):
-            inputs[2][b, L:] = float("nan")
-            inputs[3][b, L:] = float("nan")
-        for num_splits in (1, 3, 64, None):
-            o, lse = gva_decode_attention(*inputs, seq_lens, cfg.scale, num_splits)
-            name = f"{dtype} splits={num_splits}"
-            assert _check(name, o, lse, inputs, seq_lens, cfg.scale, atol), name
-
-
-def _test_cuda_graph():
-    """Capture once, then change lengths and data in place and replay."""
-    from gva_reference import GVAConfig
-
-    torch.manual_seed(0)
-    dev, dtype, atol = "cuda", torch.bfloat16, 2e-2
-    cfg = GVAConfig(d_model=64, num_heads=16, num_groups=4, d_h=128, d_n=128, d_r=16)
-    T = 1024  # max cache length for the graph
-
-    for B in (4, 128):
-        inputs = _random_inputs(cfg, B, T, dtype, dev)
-        seq_lens = torch.ones(B, dtype=torch.int32, device=dev)
-
-        gva_decode_attention(*inputs, seq_lens, cfg.scale)  # warm-up: Triton compiles here
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            o, lse = gva_decode_attention(*inputs, seq_lens, cfg.scale)
-
-        for _ in range(2):
-            new_lens = torch.randint(0, T + 1, (B,))
-            new_lens[0] = 0  # always one empty request
-            seq_lens.copy_(new_lens)
-            for t in inputs:
-                t.normal_()
-            graph.replay()
-            name = f"graph B={B} replay"
-            assert _check(name, o, lse, inputs, seq_lens, cfg.scale, atol), name
-
-
-if __name__ == "__main__":
-    _test()
-    _test_cuda_graph()
-    print("ALL PASSED")

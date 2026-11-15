@@ -1,0 +1,9 @@
+--index-url https://download.pytorch.org/whl/cu128
+--extra-index-url https://pypi.org/simple
+
+torch
+triton-windows; sys_platform == 'win32'
+triton; sys_platform != 'win32'
+pytest
+# Install with: pip install -r requirements.txt --no-build-isolation
+flash-attn
