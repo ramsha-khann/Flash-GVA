@@ -1,7 +1,7 @@
 """
 A small Llama-style model with GVA attention, generating text with the Flash-GVA kernels.
 
-The weights are random (t), so the generated text would be gibberish. What it shows is the full path a real model takes: embeddings, RMSNorm, RoPE,
+The weights are random, so the generated text would be gibberish. What it shows is the full path a real model takes: embeddings, RMSNorm, RoPE,
 SwiGLU, a KV cache, prefill, then one decode step per new token. At the end the same model
 is run again with plain PyTorch attention to check that the kernels give the same tokens.
 """
@@ -149,4 +149,3 @@ if __name__ == "__main__":
         ref_next = model(tokens).argmax(-1)[:, len(prompt) - 1:-1]
     same = (ref_next == tokens[:, len(prompt):]).sum().item()
     print(f"kernels vs plain PyTorch: {same}/{ref_next.shape[1]} tokens match")
-    
