@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def _gva_decode_split_kernel(
     Q_tilde, Q_rope, V, K_rope, Seqlens, O_part, LSE_part,
@@ -15,12 +16,12 @@ def _gva_decode_split_kernel(
     stride_op_b, stride_op_h, stride_op_s,
     stride_lp_b, stride_lp_h,
     HEADS_PER_GROUP: tl.constexpr,
-    D_H: tl.constexpr,   # head dimension
-    D_R: tl.constexpr,   #rope dim
-    BLOCK_H: tl.constexpr, #how many head pos are proccessed together
-    BLOCK_DH: tl.constexpr,   #how many dim position is being processed
+    D_H: tl.constexpr,
+    D_R: tl.constexpr,
+    BLOCK_H: tl.constexpr,  # heads of one group, padded to >= 16 for tl.dot
+    BLOCK_DH: tl.constexpr,
     BLOCK_DR: tl.constexpr,
-    BLOCK_N: tl.constexpr,#token per loop step
+    BLOCK_N: tl.constexpr,  # tokens per loop step
 ):
     g = tl.program_id(0)
     b = tl.program_id(1)
@@ -32,7 +33,7 @@ def _gva_decode_split_kernel(
     split_start = split * split_len
     split_end = tl.minimum(split_start + split_len, seqlen)
 
-    offs_h = g * HEADS_PER_GROUP + tl.arange(0, BLOCK_H) # which query heads needs to load
+    offs_h = g * HEADS_PER_GROUP + tl.arange(0, BLOCK_H)  # query heads of group g
     mask_h = tl.arange(0, BLOCK_H) < HEADS_PER_GROUP
     offs_dh = tl.arange(0, BLOCK_DH)
     offs_dr = tl.arange(0, BLOCK_DR)
@@ -88,10 +89,11 @@ def _gva_decode_split_kernel(
     tl.store(
         O_part + b64 * stride_op_b + offs_h[None, :] * stride_op_h + split * stride_op_s
         + offs_dh[:, None],
-        o.to(O_part.dtype.element_ty),  # fp32 partial, or the final O in the input dtype (1 split)
+        o.to(O_part.dtype.element_ty),  # fp32 if it gets merged, else already the output dtype
         mask=mask_dh[:, None] & mask_h[None, :],
     )
     tl.store(LSE_part + b64 * stride_lp_b + offs_h * stride_lp_h + split, lse, mask=mask_h)
+
 
 @triton.jit
 def _gva_merge_kernel(
@@ -150,12 +152,15 @@ def _ctas_per_sm(kernel):
 
 
 def _num_splits(ctas_per_split, num_sms, ctas_per_sm, max_splits):
+    # Aim for ~2/3 of the occupancy limit per SM and take the first split count
+    # that fills at least 90% of those slots.
     for per_sm in range(max(1, round(2 * ctas_per_sm / 3)), 0, -1):
         places = per_sm * num_sms
         s = min(max_splits, places // ctas_per_split)
         if s >= 1 and (ctas_per_split * s >= 0.9 * places or s == max_splits):
             return s
 
+    # Otherwise: the fewest splits whose wave efficiency is within 5% of the best.
     slots = num_sms * ctas_per_sm
     if ctas_per_split * max_splits <= slots:
         return max_splits
@@ -172,16 +177,38 @@ def gva_decode_attention(
     q_tilde, q_rope, v_cache, k_rope_cache, cache_seqlens, softmax_scale,
     num_splits=None, block_n=64, num_stages=3,
 ):
+    """
+    GVA decode: one query token per request against its KV cache.
+
+    q_tilde:       [B, H, d_h], q_nope @ M_h^T (paper eq. 7)
+    q_rope:        [B, H, d_r], rotated
+    v_cache:       [B, T, G, d_h]
+    k_rope_cache:  [B, T, d_r], rotated, shared by all heads
+    cache_seqlens: [B] int32 on the same device. Request b uses rows [0, cache_seqlens[b]),
+                   which must be <= T (not checked).
+    num_splits:    number of KV splits. None picks one from B, G, T and the GPU (needs libcuda.so.1).
+
+    Head h reads value group h // (H // G).
+    Returns out [B, H, d_h] in the input dtype and lse [B, H] in fp32 (natural log).
+    A request with length 0 gets out = 0 and lse = -inf.
+
+    Safe to capture in a CUDA graph after one warm-up call; lengths and cache contents
+    can change between replays.
+    """
     B, H, d_h = q_tilde.shape
     T, G = v_cache.shape[1], v_cache.shape[2]
     d_r = q_rope.shape[-1]
-    assert H % G == 0 and v_cache.shape[-1] == d_h and k_rope_cache.shape[-1] == d_r
+    assert q_rope.shape == (B, H, d_r)
+    assert v_cache.shape == (B, T, G, d_h)
+    assert k_rope_cache.shape == (B, T, d_r)
+    assert cache_seqlens.shape == (B,)
+    assert H % G == 0
     assert q_tilde.dtype == v_cache.dtype and q_rope.dtype == k_rope_cache.dtype
     for t in (q_tilde, q_rope, v_cache, k_rope_cache):
         assert t.stride(-1) == 1
-    # Lengths are read on-device; a CPU tensor with GPU inputs would need a
-    # host->device copy, which breaks CUDA-graph capture.
-    assert cache_seqlens.device == q_tilde.device
+    # cache_seqlens is read inside the kernel, so it has to be on the GPU too.
+    for t in (q_rope, v_cache, k_rope_cache, cache_seqlens):
+        assert t.device == q_tilde.device
     assert block_n >= 64 and block_n & (block_n - 1) == 0
 
     dev = q_tilde.device
@@ -211,7 +238,7 @@ def gva_decode_attention(
             o_part.stride(0), o_part.stride(1), o_part.stride(2),
             lse_part.stride(0), lse_part.stride(1),
         )
-       
+
     if num_splits is None:
         key = (dev, q_tilde.dtype, q_rope.dtype, heads_per_group, d_h, d_r, block_n, num_stages)
         if key not in _CTAS_PER_SM:

@@ -3,6 +3,7 @@ import torch
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def _attend_tiles(
     acc, m_i, l_i, q_tilde, q_rope, v_base, kr_base,
@@ -10,7 +11,6 @@ def _attend_tiles(
     D_H: tl.constexpr, D_R: tl.constexpr, BLOCK_DR: tl.constexpr, BLOCK_N: tl.constexpr,
     ON_DIAGONAL: tl.constexpr,
 ):
-
     offs_dh = tl.arange(0, D_H)
     offs_dr = tl.arange(0, BLOCK_DR)
     for start_n in range(start, end, BLOCK_N):
@@ -37,6 +37,7 @@ def _attend_tiles(
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)  # the same V tile, now as values
         m_i = m_new
     return acc, m_i, l_i
+
 
 @triton.jit
 def _gva_prefill_kernel(
@@ -106,6 +107,17 @@ def gva_prefill_attention(
     q_tilde, q_rope, v, k_rope, softmax_scale,
     block_m=128, block_n=64, num_warps=8, num_stages=3,
 ):
+    """
+    GVA prefill: causal attention over the whole prompt.
+
+    q_tilde: [B, S, H, d_h], q_nope @ M_h^T (paper eq. 7). d_h must be a power of 2, >= 16.
+    q_rope:  [B, S, H, d_r], rotated
+    v:       [B, S, G, d_h]
+    k_rope:  [B, S, d_r], rotated, shared by all heads
+
+    Head h reads value group h // (H // G). fp16 or bf16 only, and every sequence has length S.
+    Returns out [B, S, H, d_h]. No lse.
+    """
     B, S, H, d_h = q_tilde.shape
     G, d_r = v.shape[2], q_rope.shape[-1]
     assert q_rope.shape == (B, S, H, d_r) and v.shape == (B, S, G, d_h) and k_rope.shape == (B, S, d_r)
@@ -113,17 +125,12 @@ def gva_prefill_attention(
     assert q_tilde.dtype in (torch.bfloat16, torch.float16)
     assert q_rope.dtype == v.dtype == k_rope.dtype == q_tilde.dtype
     assert d_h >= 16 and d_h & (d_h - 1) == 0
-    assert block_m % block_n == 0, "the diagonal must start on a key-tile boundary"
     for t in (q_tilde, q_rope, v, k_rope):
-        assert t.stride(-1) == 1, "the kernel indexes the last dim with stride 1"
-    assert block_m >= 16
-    assert block_n >= 16
+        assert t.stride(-1) == 1
+    assert block_m >= 16 and block_m & (block_m - 1) == 0
+    assert block_n >= 16 and block_n & (block_n - 1) == 0
+    assert block_m % block_n == 0, "the diagonal must start on a key-tile boundary"
 
-    assert (block_m & (block_m - 1)) == 0
-    assert (block_n & (block_n - 1)) == 0
-
-    assert block_m % block_n == 0
-    
     o = torch.empty(B, S, H, d_h, dtype=q_tilde.dtype, device=q_tilde.device)
     grid = (B * H, triton.cdiv(S, block_m))
     _gva_prefill_kernel[grid](

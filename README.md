@@ -1,32 +1,34 @@
 # Flash-GVA
 
-Triton decode kernel for GVA attention, with a plain PyTorch reference to check it against.
+Triton prefill and decode kernels for GVA attention, with a plain PyTorch reference to check them against.
 
-- `gva_decode_triton.py` - the Triton kernel (`gva_decode_attention`)
-- `gva_reference.py` - PyTorch reference (`gva_decode_attention_ref`)
-- `tests/test_gva_decode.py` - compares the kernel with the reference
+- `flash_gva/decode.py` - decode kernel (`gva_decode_attention`)
+- `flash_gva/prefill.py` - prefill kernel (`gva_prefill_attention`)
+- `flash_gva/reference.py` - PyTorch reference for decode (`gva_decode_attention_ref`)
+- `tests/` - compares the kernels with the reference and with PyTorch SDPA
 
 ## Setup
 
-Needs an NVIDIA GPU with CUDA 12.8 drivers.
+Needs Linux and an NVIDIA GPU. Install PyTorch for your CUDA version first, then:
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu128
-pip install -r requirements.txt --no-build-isolation
+pip install -e .
 ```
 
 ## Run the tests
 
 ```bash
+pip install pytest
 pytest -v tests/
 ```
 
 ## Use it
 
 ```python
-from gva_decode_triton import gva_decode_attention
+from flash_gva import gva_decode_attention, gva_prefill_attention
 
-out, lse = gva_decode_attention(q_tilde, q_rope, v_cache, k_rope_cache, cache_seqlens, softmax_scale)
+out = gva_prefill_attention(q_tilde, q_rope, v, k_rope, softmax_scale)                               # prompt
+out, lse = gva_decode_attention(q_tilde, q_rope, v_cache, k_rope_cache, cache_seqlens, softmax_scale)  # each new token
 ```
 
 Shapes: `q_tilde [B, H, d_h]`, `q_rope [B, H, d_r]`, `v_cache [B, T, G, d_h]`, `k_rope_cache [B, T, d_r]`, `cache_seqlens [B]` (int32, on the GPU).
